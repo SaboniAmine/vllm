@@ -21,8 +21,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Measurement interval matching NVML hardware update rate
-_MEASURE_INTERVAL_SECS = 0.1  # 100ms
+# Measurement interval for background sampling
+_MEASURE_INTERVAL_SECS = 0.05  # 50ms
 
 
 class EnergyMetrics:
@@ -61,8 +61,8 @@ class EnergyMetrics:
             )
             self._tracker.start()
             logger.info(
-                "Energy tracking enabled (interval=%.0fms, country=%s)",
-                _MEASURE_INTERVAL_SECS * 1000,
+                "Energy tracking enabled (interval=%dms, country=%s)",
+                int(_MEASURE_INTERVAL_SECS * 1000),
                 country_code,
             )
         except ImportError:
