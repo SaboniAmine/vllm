@@ -162,6 +162,21 @@ class KVCacheEvictionEvent:
 
 
 @dataclass
+class EnergyStats:
+    """Stats associated with energy tracking for a single batch/step.
+
+    Created from CodeCarbon's stop_task() EmissionsData result.
+    """
+
+    # Energy consumed in this batch (kWh)
+    energy_consumed: float = 0.0
+
+    # Tokens processed in this batch
+    num_prompt_tokens: int = 0
+    num_generation_tokens: int = 0
+
+
+@dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
 

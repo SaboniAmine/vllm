@@ -44,6 +44,7 @@ from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+from vllm.v1.metrics.energy import EnergyMetrics
 from vllm.v1.metrics.stats import (
     PrefixCacheStats,
     SchedulerStats,
@@ -223,6 +224,11 @@ class Scheduler(SchedulerInterface):
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
+
+        # Energy tracking (CodeCarbon integration)
+        self.energy_metrics: EnergyMetrics | None = None
+        if self.log_stats:
+            self.energy_metrics = EnergyMetrics()
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -1358,6 +1364,9 @@ class Scheduler(SchedulerInterface):
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
+        # Record start energy for this request (reads from cache, instant)
+        if self.energy_metrics and self.energy_metrics.is_enabled():
+            request._energy_start_kwh = self.energy_metrics.get_energy_kwh()
 
     def finish_requests(
         self,
@@ -1405,6 +1414,19 @@ class Scheduler(SchedulerInterface):
 
     def _free_request(self, request: Request) -> dict[str, Any] | None:
         assert request.is_finished()
+
+        # Compute energy consumed by this request (reads from cache, instant)
+        if self.energy_metrics and self.energy_metrics.is_enabled():
+            current_energy = self.energy_metrics.get_energy_kwh()
+            request.energy_consumed_kwh = max(
+                0.0, current_energy - request._energy_start_kwh
+            )
+            if self.log_stats:
+                logger.info(
+                    "Request %s energy: %.6f kWh",
+                    request.request_id,
+                    request.energy_consumed_kwh,
+                )
 
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)

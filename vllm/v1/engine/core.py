@@ -854,6 +854,14 @@ class EngineCoreProc(EngineCore):
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
+        # Optional subprocess profiling (VLLM_PROFILE_SUBPROCESS=1)
+        profile_subprocess = os.environ.get("VLLM_PROFILE_SUBPROCESS", "0") == "1"
+        profiler = None
+        if profile_subprocess:
+            import cProfile
+            profiler = cProfile.Profile()
+            profiler.enable()
+
         engine_core: EngineCoreProc | None = None
         try:
             parallel_config: ParallelConfig = kwargs["vllm_config"].parallel_config
@@ -882,6 +890,13 @@ class EngineCoreProc(EngineCore):
                 engine_core._send_engine_dead()
             raise e
         finally:
+            if profiler is not None:
+                profiler.disable()
+                profile_output = os.environ.get(
+                    "VLLM_PROFILE_OUTPUT", "/tmp/vllm_subprocess_profile.prof"
+                )
+                profiler.dump_stats(profile_output)
+                logger.info("Subprocess profile saved to: %s", profile_output)
             if engine_core is not None:
                 engine_core.shutdown()
 

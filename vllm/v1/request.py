@@ -129,6 +129,11 @@ class Request:
         # The number of tokens that have been computed remotely.
         self.num_external_computed_tokens = 0
 
+        # Energy tracking: start reading and final consumption (kWh)
+        # Set by scheduler from cached background measurements
+        self._energy_start_kwh: float = 0.0
+        self.energy_consumed_kwh: float = 0.0
+
         self.block_hashes: list[BlockHash] = []
         self.get_hash_new_full_blocks: Callable[[], list[BlockHash]] | None = None
         if block_hasher is not None:
