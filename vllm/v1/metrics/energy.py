@@ -43,6 +43,12 @@ class EnergyMetrics:
         self._enabled = os.environ.get("VLLM_TRACK_ENERGY", "0") == "1"
         self._tracker: "OfflineEmissionsTracker | None" = None
 
+        # Accumulated totals for prefill vs decode energy
+        self._total_prefill_energy_kwh: float = 0.0
+        self._total_decode_energy_kwh: float = 0.0
+        self._total_prefill_tokens: int = 0
+        self._total_decode_tokens: int = 0
+
         if self._enabled:
             self._init_tracker()
 
@@ -88,6 +94,40 @@ class EnergyMetrics:
         if not self.is_enabled():
             return 0.0
         return getattr(self._tracker._total_energy, "kWh", 0.0)
+
+    def accumulate(
+        self,
+        prefill_energy: float,
+        decode_energy: float,
+        prefill_tokens: int,
+        decode_tokens: int,
+    ) -> None:
+        """Accumulate prefill/decode energy totals.
+
+        Args:
+            prefill_energy: Energy attributed to prefill in this step (kWh)
+            decode_energy: Energy attributed to decode in this step (kWh)
+            prefill_tokens: Number of prefill tokens in this step
+            decode_tokens: Number of decode tokens in this step
+        """
+        self._total_prefill_energy_kwh += prefill_energy
+        self._total_decode_energy_kwh += decode_energy
+        self._total_prefill_tokens += prefill_tokens
+        self._total_decode_tokens += decode_tokens
+
+    def get_totals(self) -> tuple[float, float, int, int]:
+        """Return accumulated prefill/decode energy totals.
+
+        Returns:
+            Tuple of (total_prefill_energy_kwh, total_decode_energy_kwh,
+                      total_prefill_tokens, total_decode_tokens)
+        """
+        return (
+            self._total_prefill_energy_kwh,
+            self._total_decode_energy_kwh,
+            self._total_prefill_tokens,
+            self._total_decode_tokens,
+        )
 
     def shutdown(self) -> None:
         """Stop the energy tracker and clean up resources."""

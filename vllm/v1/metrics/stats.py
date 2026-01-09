@@ -165,15 +165,27 @@ class KVCacheEvictionEvent:
 class EnergyStats:
     """Stats associated with energy tracking for a single batch/step.
 
-    Created from CodeCarbon's stop_task() EmissionsData result.
+    Tracks step-level energy consumption with prefill vs decode attribution.
+    Energy is measured around each scheduler step and proportionally
+    attributed based on token types processed.
     """
 
-    # Energy consumed in this batch (kWh)
-    energy_consumed: float = 0.0
+    # Energy consumed in this step (kWh)
+    step_energy_kwh: float = 0.0
 
-    # Tokens processed in this batch
-    num_prompt_tokens: int = 0
-    num_generation_tokens: int = 0
+    # Prefill vs decode energy attribution (kWh)
+    prefill_energy_kwh: float = 0.0
+    decode_energy_kwh: float = 0.0
+
+    # Token counts for this step
+    num_prefill_tokens: int = 0
+    num_decode_tokens: int = 0
+
+    # Running totals (accumulated across steps)
+    total_prefill_energy_kwh: float = 0.0
+    total_decode_energy_kwh: float = 0.0
+    total_prefill_tokens: int = 0
+    total_decode_tokens: int = 0
 
 
 @dataclass
@@ -203,6 +215,8 @@ class SchedulerStats:
     cudagraph_stats: CUDAGraphStat | None = None
 
     perf_stats: PerfStats | None = None
+
+    energy_stats: EnergyStats | None = None
 
 
 @dataclass
