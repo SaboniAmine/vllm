@@ -9,10 +9,17 @@ The scheduler handles attribution by reading energy at request start/end.
 Key insight: NVML has ~100ms update cycle on modern GPUs. Background
 sampling at this rate gives zero critical-path overhead with no loss
 in precision.
+
+Environment Variables:
+    VLLM_TRACK_ENERGY: Set to "1" to enable energy tracking
+    VLLM_ENERGY_OUTPUT: Path to JSON file for step-level energy data
+    CODECARBON_COUNTRY: ISO country code for carbon intensity (default: USA)
 """
 
+import json
 import os
-from typing import TYPE_CHECKING
+import time
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
@@ -48,6 +55,12 @@ class EnergyMetrics:
         self._total_decode_energy_kwh: float = 0.0
         self._total_prefill_tokens: int = 0
         self._total_decode_tokens: int = 0
+
+        # JSON output for analysis
+        self._output_path = os.environ.get("VLLM_ENERGY_OUTPUT", "")
+        self._step_history: list[dict[str, Any]] = []
+        self._step_count: int = 0
+        self._start_time: float = time.time()
 
         if self._enabled:
             self._init_tracker()
@@ -115,6 +128,26 @@ class EnergyMetrics:
         self._total_prefill_tokens += prefill_tokens
         self._total_decode_tokens += decode_tokens
 
+        # Record step data for JSON output
+        if self._output_path:
+            self._step_count += 1
+            step_data = {
+                "step": self._step_count,
+                "timestamp": time.time() - self._start_time,
+                "step_energy_kwh": prefill_energy + decode_energy,
+                "prefill_energy_kwh": prefill_energy,
+                "decode_energy_kwh": decode_energy,
+                "prefill_tokens": prefill_tokens,
+                "decode_tokens": decode_tokens,
+                "total_tokens": prefill_tokens + decode_tokens,
+                # Running totals
+                "cumulative_prefill_energy_kwh": self._total_prefill_energy_kwh,
+                "cumulative_decode_energy_kwh": self._total_decode_energy_kwh,
+                "cumulative_prefill_tokens": self._total_prefill_tokens,
+                "cumulative_decode_tokens": self._total_decode_tokens,
+            }
+            self._step_history.append(step_data)
+
     def get_totals(self) -> tuple[float, float, int, int]:
         """Return accumulated prefill/decode energy totals.
 
@@ -129,8 +162,63 @@ class EnergyMetrics:
             self._total_decode_tokens,
         )
 
+    def save_to_json(self) -> None:
+        """Save step history to JSON file if output path is configured."""
+        if not self._output_path or not self._step_history:
+            return
+
+        # Compute per-token energy metrics
+        total_energy = self._total_prefill_energy_kwh + self._total_decode_energy_kwh
+        total_tokens = self._total_prefill_tokens + self._total_decode_tokens
+
+        output_data = {
+            "summary": {
+                "total_steps": self._step_count,
+                "total_duration_seconds": time.time() - self._start_time,
+                "total_energy_kwh": total_energy,
+                "total_energy_wh": total_energy * 1000,
+                "prefill": {
+                    "energy_kwh": self._total_prefill_energy_kwh,
+                    "energy_wh": self._total_prefill_energy_kwh * 1000,
+                    "tokens": self._total_prefill_tokens,
+                    "joules_per_token": (
+                        (self._total_prefill_energy_kwh * 3600000)
+                        / self._total_prefill_tokens
+                        if self._total_prefill_tokens > 0 else 0.0
+                    ),
+                },
+                "decode": {
+                    "energy_kwh": self._total_decode_energy_kwh,
+                    "energy_wh": self._total_decode_energy_kwh * 1000,
+                    "tokens": self._total_decode_tokens,
+                    "joules_per_token": (
+                        (self._total_decode_energy_kwh * 3600000)
+                        / self._total_decode_tokens
+                        if self._total_decode_tokens > 0 else 0.0
+                    ),
+                },
+                "total_tokens": total_tokens,
+                "avg_joules_per_token": (
+                    (total_energy * 3600000) / total_tokens
+                    if total_tokens > 0 else 0.0
+                ),
+            },
+            "steps": self._step_history,
+        }
+
+        try:
+            with open(self._output_path, "w") as f:
+                json.dump(output_data, f, indent=2)
+            logger.info("Energy stats saved to: %s", self._output_path)
+        except Exception as e:
+            logger.warning("Failed to save energy stats to %s: %s",
+                          self._output_path, e)
+
     def shutdown(self) -> None:
         """Stop the energy tracker and clean up resources."""
+        # Save JSON output before stopping
+        self.save_to_json()
+
         if self._tracker:
             self._tracker.stop()
             self._tracker = None
