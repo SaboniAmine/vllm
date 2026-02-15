@@ -134,6 +134,13 @@ class Request:
         self._energy_start_kwh: float = 0.0
         self.energy_consumed_kwh: float = 0.0
 
+        # Prefill/decode energy breakdown (experimental)
+        # Records energy at prefill->decode transition for attribution
+        self._energy_prefill_end_kwh: float = 0.0
+        self._prefill_completed: bool = False
+        self.prefill_energy_kwh: float = 0.0
+        self.decode_energy_kwh: float = 0.0
+
         self.block_hashes: list[BlockHash] = []
         self.get_hash_new_full_blocks: Callable[[], list[BlockHash]] | None = None
         if block_hasher is not None:

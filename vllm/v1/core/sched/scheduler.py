@@ -1107,6 +1107,22 @@ class Scheduler(SchedulerInterface):
 
         return prefill_tokens, decode_tokens
 
+    def _track_request_energy_transition(self, request: Request) -> None:
+        """Track prefill->decode energy transition for a request.
+
+        Called after tokens are processed. If the request just completed
+        prefill (num_computed_tokens >= num_prompt_tokens for the first time),
+        record the current energy for later breakdown calculation.
+        """
+        if not (self.energy_metrics and self.energy_metrics.is_enabled()):
+            return
+
+        # Check if prefill just completed
+        if (not request._prefill_completed and
+                request.num_computed_tokens >= request.num_prompt_tokens):
+            request._energy_prefill_end_kwh = self.energy_metrics.get_energy_kwh()
+            request._prefill_completed = True
+
     def _compute_step_energy_stats(
         self, num_scheduled_tokens: dict[str, int]
     ) -> None:
@@ -1283,6 +1299,9 @@ class Scheduler(SchedulerInterface):
                 assert struct_output_request is not None
                 assert struct_output_request.grammar is not None
                 struct_output_request.grammar.accept_tokens(req_id, new_token_ids)
+
+            # Track prefill->decode energy transition for this request
+            self._track_request_energy_transition(request)
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
@@ -1521,12 +1540,45 @@ class Scheduler(SchedulerInterface):
             request.energy_consumed_kwh = max(
                 0.0, current_energy - request._energy_start_kwh
             )
+
+            # Calculate prefill/decode energy breakdown
+            if request._prefill_completed and request._energy_prefill_end_kwh > 0:
+                # Request transitioned from prefill to decode
+                request.prefill_energy_kwh = max(
+                    0.0, request._energy_prefill_end_kwh - request._energy_start_kwh
+                )
+                request.decode_energy_kwh = max(
+                    0.0, current_energy - request._energy_prefill_end_kwh
+                )
+            elif request._prefill_completed:
+                # Prefill completed but no transition energy recorded
+                # All energy goes to decode (likely short prefill)
+                request.prefill_energy_kwh = 0.0
+                request.decode_energy_kwh = request.energy_consumed_kwh
+            else:
+                # Prefill never completed (request finished during prefill)
+                request.prefill_energy_kwh = request.energy_consumed_kwh
+                request.decode_energy_kwh = 0.0
+
             if self.log_stats:
                 logger.info(
-                    "Request %s energy: %.6f kWh",
+                    "Request %s energy: %.6f kWh total "
+                    "(prefill: %.6f kWh, decode: %.6f kWh)",
                     request.request_id,
                     request.energy_consumed_kwh,
+                    request.prefill_energy_kwh,
+                    request.decode_energy_kwh,
                 )
+
+            # Record per-request energy for JSON output
+            self.energy_metrics.record_request_energy(
+                request_id=request.request_id,
+                total_energy_kwh=request.energy_consumed_kwh,
+                prefill_energy_kwh=request.prefill_energy_kwh,
+                decode_energy_kwh=request.decode_energy_kwh,
+                num_prompt_tokens=request.num_prompt_tokens,
+                num_output_tokens=request.num_output_tokens,
+            )
 
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)

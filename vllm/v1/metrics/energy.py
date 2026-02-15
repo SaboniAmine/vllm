@@ -59,6 +59,7 @@ class EnergyMetrics:
         # JSON output for analysis
         self._output_path = os.environ.get("VLLM_ENERGY_OUTPUT", "")
         self._step_history: list[dict[str, Any]] = []
+        self._request_history: list[dict[str, Any]] = []
         self._step_count: int = 0
         self._start_time: float = time.time()
 
@@ -162,9 +163,53 @@ class EnergyMetrics:
             self._total_decode_tokens,
         )
 
+    def record_request_energy(
+        self,
+        request_id: str,
+        total_energy_kwh: float,
+        prefill_energy_kwh: float,
+        decode_energy_kwh: float,
+        num_prompt_tokens: int,
+        num_output_tokens: int,
+    ) -> None:
+        """Record per-request energy data for JSON output.
+
+        Args:
+            request_id: Unique identifier for the request
+            total_energy_kwh: Total energy consumed by the request
+            prefill_energy_kwh: Energy attributed to prefill phase
+            decode_energy_kwh: Energy attributed to decode phase
+            num_prompt_tokens: Number of prompt tokens
+            num_output_tokens: Number of generated tokens
+        """
+        if not self._output_path:
+            return
+
+        request_data = {
+            "request_id": request_id,
+            "timestamp": time.time() - self._start_time,
+            "total_energy_kwh": total_energy_kwh,
+            "prefill_energy_kwh": prefill_energy_kwh,
+            "decode_energy_kwh": decode_energy_kwh,
+            "num_prompt_tokens": num_prompt_tokens,
+            "num_output_tokens": num_output_tokens,
+            "total_tokens": num_prompt_tokens + num_output_tokens,
+            "prefill_joules_per_token": (
+                (prefill_energy_kwh * 3600000) / num_prompt_tokens
+                if num_prompt_tokens > 0 else 0.0
+            ),
+            "decode_joules_per_token": (
+                (decode_energy_kwh * 3600000) / num_output_tokens
+                if num_output_tokens > 0 else 0.0
+            ),
+        }
+        self._request_history.append(request_data)
+
     def save_to_json(self) -> None:
-        """Save step history to JSON file if output path is configured."""
-        if not self._output_path or not self._step_history:
+        """Save energy data to JSON file if output path is configured."""
+        if not self._output_path:
+            return
+        if not self._step_history and not self._request_history:
             return
 
         # Compute per-token energy metrics
@@ -174,6 +219,7 @@ class EnergyMetrics:
         output_data = {
             "summary": {
                 "total_steps": self._step_count,
+                "total_requests": len(self._request_history),
                 "total_duration_seconds": time.time() - self._start_time,
                 "total_energy_kwh": total_energy,
                 "total_energy_wh": total_energy * 1000,
@@ -204,6 +250,7 @@ class EnergyMetrics:
                 ),
             },
             "steps": self._step_history,
+            "requests": self._request_history,
         }
 
         try:
