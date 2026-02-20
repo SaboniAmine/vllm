@@ -247,11 +247,13 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
-        # === DEMO BREAKPOINT 1: schedule() entry ===
-        # Inspect: self.waiting, self.running, self.requests
-        print(f"\n>>> [SCHEDULER] schedule() called | "
-              f"waiting={len(self.waiting)} running={len(self.running)}")
-        breakpoint()
+        # ── schedule() entry ──
+        print(f"\n{'─'*60}")
+        print(f"  SCHEDULE START | waiting={len(self.waiting)} "
+              f"running={len(self.running)} total_reqs={len(self.requests)}")
+        print(f"  budget={self.max_num_scheduled_tokens} tokens, "
+              f"max_seqs={self.max_num_running_reqs}")
+        print(f"{'─'*60}")
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -270,7 +272,8 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
-        # First, schedule the RUNNING requests.
+        # ── Phase A: schedule RUNNING requests (decode / continued prefill) ──
+        print(f"  ├─ Phase A: scheduling RUNNING requests ({len(self.running)} in queue)")
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
@@ -450,6 +453,9 @@ class Scheduler(SchedulerInterface):
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
 
+        # ── Phase B: schedule WAITING requests (new prefills) ──
+        print(f"  ├─ Phase B: scheduling WAITING requests ({len(self.waiting)} in queue) "
+              f"| budget_remaining={token_budget}")
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
@@ -682,14 +688,11 @@ class Scheduler(SchedulerInterface):
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
 
-        # === DEMO BREAKPOINT 2: after scheduling both RUNNING + WAITING ===
-        # Inspect: scheduled_new_reqs, scheduled_running_reqs,
-        #          num_scheduled_tokens, token_budget (remaining)
-        print(f">>> [SCHEDULER] scheduled: "
-              f"new={len(scheduled_new_reqs)} "
-              f"running={len(scheduled_running_reqs)} "
-              f"tokens={num_scheduled_tokens}")
-        breakpoint()
+        # ── Phase C: build SchedulerOutput ──
+        print(f"  ├─ Phase C: building output | "
+              f"new={len(scheduled_new_reqs)} running={len(scheduled_running_reqs)} "
+              f"resumed={len(scheduled_resumed_reqs)}")
+        print(f"  └─ tokens_per_req={num_scheduled_tokens}")
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1196,14 +1199,6 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        # === DEMO BREAKPOINT 3: after model execution ===
-        # Inspect: model_runner_output.sampled_token_ids,
-        #          scheduler_output.num_scheduled_tokens,
-        #          self.running (request states)
-        print(f">>> [SCHEDULER] update_from_output() | "
-              f"sampled_tokens={model_runner_output.sampled_token_ids}")
-        breakpoint()
-
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
