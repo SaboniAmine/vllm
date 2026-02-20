@@ -247,6 +247,12 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        # === DEMO BREAKPOINT 1: schedule() entry ===
+        # Inspect: self.waiting, self.running, self.requests
+        print(f"\n>>> [SCHEDULER] schedule() called | "
+              f"waiting={len(self.waiting)} running={len(self.running)}")
+        breakpoint()
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -675,6 +681,15 @@ class Scheduler(SchedulerInterface):
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
+
+        # === DEMO BREAKPOINT 2: after scheduling both RUNNING + WAITING ===
+        # Inspect: scheduled_new_reqs, scheduled_running_reqs,
+        #          num_scheduled_tokens, token_budget (remaining)
+        print(f">>> [SCHEDULER] scheduled: "
+              f"new={len(scheduled_new_reqs)} "
+              f"running={len(scheduled_running_reqs)} "
+              f"tokens={num_scheduled_tokens}")
+        breakpoint()
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1181,6 +1196,14 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        # === DEMO BREAKPOINT 3: after model execution ===
+        # Inspect: model_runner_output.sampled_token_ids,
+        #          scheduler_output.num_scheduled_tokens,
+        #          self.running (request states)
+        print(f">>> [SCHEDULER] update_from_output() | "
+              f"sampled_tokens={model_runner_output.sampled_token_ids}")
+        breakpoint()
+
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
