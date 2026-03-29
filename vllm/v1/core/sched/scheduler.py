@@ -44,7 +44,9 @@ from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+from vllm.v1.metrics.energy import EnergyMetrics
 from vllm.v1.metrics.stats import (
+    EnergyStats,
     PrefixCacheStats,
     SchedulerStats,
 )
@@ -224,6 +226,15 @@ class Scheduler(SchedulerInterface):
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
 
+        # Energy tracking (CodeCarbon integration)
+        self.energy_metrics: EnergyMetrics | None = None
+        if self.log_stats:
+            self.energy_metrics = EnergyMetrics()
+
+        # Step-level energy tracking for prefill/decode attribution
+        self._step_energy_start_kwh: float = 0.0
+        self._step_energy_stats: "EnergyStats | None" = None
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -235,6 +246,14 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
+
+        # ── schedule() entry ──
+        print(f"\n{'─'*60}")
+        print(f"  SCHEDULE START | waiting={len(self.waiting)} "
+              f"running={len(self.running)} total_reqs={len(self.requests)}")
+        print(f"  budget={self.max_num_scheduled_tokens} tokens, "
+              f"max_seqs={self.max_num_running_reqs}")
+        print(f"{'─'*60}")
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -253,7 +272,8 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
-        # First, schedule the RUNNING requests.
+        # ── Phase A: schedule RUNNING requests (decode / continued prefill) ──
+        print(f"  ├─ Phase A: scheduling RUNNING requests ({len(self.running)} in queue)")
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
@@ -433,6 +453,9 @@ class Scheduler(SchedulerInterface):
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
 
+        # ── Phase B: schedule WAITING requests (new prefills) ──
+        print(f"  ├─ Phase B: scheduling WAITING requests ({len(self.waiting)} in queue) "
+              f"| budget_remaining={token_budget}")
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
@@ -665,6 +688,12 @@ class Scheduler(SchedulerInterface):
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
 
+        # ── Phase C: build SchedulerOutput ──
+        print(f"  ├─ Phase C: building output | "
+              f"new={len(scheduled_new_reqs)} running={len(scheduled_running_reqs)} "
+              f"resumed={len(scheduled_resumed_reqs)}")
+        print(f"  └─ tokens_per_req={num_scheduled_tokens}")
+
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
@@ -759,6 +788,11 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        # Record energy reading before model execution (for step-level tracking)
+        if self.energy_metrics and self.energy_metrics.is_enabled():
+            self._step_energy_start_kwh = self.energy_metrics.get_energy_kwh()
+
         return scheduler_output
 
     def _preempt_request(
@@ -1057,6 +1091,109 @@ class Scheduler(SchedulerInterface):
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
+    def _get_prefill_decode_tokens(
+        self, req_id: str, num_scheduled: int
+    ) -> tuple[int, int]:
+        """Calculate prefill vs decode tokens for a request in this step.
+
+        Args:
+            req_id: The request ID
+            num_scheduled: Number of tokens scheduled for this request
+
+        Returns:
+            (prefill_tokens, decode_tokens) for this step
+        """
+        request = self.requests.get(req_id)
+        if request is None:
+            return 0, 0
+
+        # num_computed_tokens was already advanced by num_scheduled in
+        # _update_after_schedule(), so compute the "before" state
+        num_computed_before = request.num_computed_tokens - num_scheduled
+
+        if num_computed_before < request.num_prompt_tokens:
+            # Some or all tokens are prefill
+            prefill_tokens = min(
+                num_scheduled,
+                request.num_prompt_tokens - num_computed_before
+            )
+            decode_tokens = num_scheduled - prefill_tokens
+        else:
+            # All tokens are decode
+            prefill_tokens = 0
+            decode_tokens = num_scheduled
+
+        return prefill_tokens, decode_tokens
+
+    def _track_request_energy_transition(self, request: Request) -> None:
+        """Track prefill->decode energy transition for a request.
+
+        Called after tokens are processed. If the request just completed
+        prefill (num_computed_tokens >= num_prompt_tokens for the first time),
+        record the current energy for later breakdown calculation.
+        """
+        if not (self.energy_metrics and self.energy_metrics.is_enabled()):
+            return
+
+        # Check if prefill just completed
+        if (not request._prefill_completed and
+                request.num_computed_tokens >= request.num_prompt_tokens):
+            request._energy_prefill_end_kwh = self.energy_metrics.get_energy_kwh()
+            request._prefill_completed = True
+
+    def _compute_step_energy_stats(
+        self, num_scheduled_tokens: dict[str, int]
+    ) -> None:
+        """Compute step energy stats with prefill/decode attribution.
+
+        Args:
+            num_scheduled_tokens: Map of request_id to tokens scheduled
+        """
+        if not (self.energy_metrics and self.energy_metrics.is_enabled()):
+            self._step_energy_stats = None
+            return
+
+        energy_after = self.energy_metrics.get_energy_kwh()
+        step_energy = max(0.0, energy_after - self._step_energy_start_kwh)
+
+        # Accumulate prefill/decode tokens across all requests
+        total_prefill_tokens = 0
+        total_decode_tokens = 0
+
+        for req_id, num_tokens in num_scheduled_tokens.items():
+            prefill, decode = self._get_prefill_decode_tokens(req_id, num_tokens)
+            total_prefill_tokens += prefill
+            total_decode_tokens += decode
+
+        total_tokens = total_prefill_tokens + total_decode_tokens
+        if total_tokens > 0 and step_energy > 0:
+            # Proportional attribution
+            prefill_energy = step_energy * (total_prefill_tokens / total_tokens)
+            decode_energy = step_energy * (total_decode_tokens / total_tokens)
+
+            # Accumulate totals in energy_metrics
+            self.energy_metrics.accumulate(
+                prefill_energy, decode_energy,
+                total_prefill_tokens, total_decode_tokens
+            )
+
+            # Get running totals
+            totals = self.energy_metrics.get_totals()
+
+            self._step_energy_stats = EnergyStats(
+                step_energy_kwh=step_energy,
+                prefill_energy_kwh=prefill_energy,
+                decode_energy_kwh=decode_energy,
+                num_prefill_tokens=total_prefill_tokens,
+                num_decode_tokens=total_decode_tokens,
+                total_prefill_energy_kwh=totals[0],
+                total_decode_energy_kwh=totals[1],
+                total_prefill_tokens=totals[2],
+                total_decode_tokens=totals[3],
+            )
+        else:
+            self._step_energy_stats = None
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1070,6 +1207,9 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+
+        # Compute step energy stats with prefill/decode attribution
+        self._compute_step_energy_stats(num_scheduled_tokens)
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1177,6 +1317,9 @@ class Scheduler(SchedulerInterface):
                 assert struct_output_request is not None
                 assert struct_output_request.grammar is not None
                 struct_output_request.grammar.accept_tokens(req_id, new_token_ids)
+
+            # Track prefill->decode energy transition for this request
+            self._track_request_energy_transition(request)
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
@@ -1358,6 +1501,9 @@ class Scheduler(SchedulerInterface):
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
+        # Record start energy for this request (reads from cache, instant)
+        if self.energy_metrics and self.energy_metrics.is_enabled():
+            request._energy_start_kwh = self.energy_metrics.get_energy_kwh()
 
     def finish_requests(
         self,
@@ -1405,6 +1551,52 @@ class Scheduler(SchedulerInterface):
 
     def _free_request(self, request: Request) -> dict[str, Any] | None:
         assert request.is_finished()
+
+        # Compute energy consumed by this request (reads from cache, instant)
+        if self.energy_metrics and self.energy_metrics.is_enabled():
+            current_energy = self.energy_metrics.get_energy_kwh()
+            request.energy_consumed_kwh = max(
+                0.0, current_energy - request._energy_start_kwh
+            )
+
+            # Calculate prefill/decode energy breakdown
+            if request._prefill_completed and request._energy_prefill_end_kwh > 0:
+                # Request transitioned from prefill to decode
+                request.prefill_energy_kwh = max(
+                    0.0, request._energy_prefill_end_kwh - request._energy_start_kwh
+                )
+                request.decode_energy_kwh = max(
+                    0.0, current_energy - request._energy_prefill_end_kwh
+                )
+            elif request._prefill_completed:
+                # Prefill completed but no transition energy recorded
+                # All energy goes to decode (likely short prefill)
+                request.prefill_energy_kwh = 0.0
+                request.decode_energy_kwh = request.energy_consumed_kwh
+            else:
+                # Prefill never completed (request finished during prefill)
+                request.prefill_energy_kwh = request.energy_consumed_kwh
+                request.decode_energy_kwh = 0.0
+
+            if self.log_stats:
+                logger.info(
+                    "Request %s energy: %.6f kWh total "
+                    "(prefill: %.6f kWh, decode: %.6f kWh)",
+                    request.request_id,
+                    request.energy_consumed_kwh,
+                    request.prefill_energy_kwh,
+                    request.decode_energy_kwh,
+                )
+
+            # Record per-request energy for JSON output
+            self.energy_metrics.record_request_energy(
+                request_id=request.request_id,
+                total_energy_kwh=request.energy_consumed_kwh,
+                prefill_energy_kwh=request.prefill_energy_kwh,
+                decode_energy_kwh=request.decode_energy_kwh,
+                num_prompt_tokens=request.num_prompt_tokens,
+                num_output_tokens=request.num_output_tokens,
+            )
 
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
@@ -1510,6 +1702,11 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+
+        # Get step energy stats and reset for next step
+        energy_stats = self._step_energy_stats
+        self._step_energy_stats = None
+
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
@@ -1521,6 +1718,7 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            energy_stats=energy_stats,
         )
 
     def make_spec_decoding_stats(
@@ -1543,6 +1741,8 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
             self.connector.shutdown()
+        if self.energy_metrics is not None:
+            self.energy_metrics.shutdown()
 
     ########################################################################
     # KV Connector Related Methods

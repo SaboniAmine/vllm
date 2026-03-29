@@ -162,6 +162,33 @@ class KVCacheEvictionEvent:
 
 
 @dataclass
+class EnergyStats:
+    """Stats associated with energy tracking for a single batch/step.
+
+    Tracks step-level energy consumption with prefill vs decode attribution.
+    Energy is measured around each scheduler step and proportionally
+    attributed based on token types processed.
+    """
+
+    # Energy consumed in this step (kWh)
+    step_energy_kwh: float = 0.0
+
+    # Prefill vs decode energy attribution (kWh)
+    prefill_energy_kwh: float = 0.0
+    decode_energy_kwh: float = 0.0
+
+    # Token counts for this step
+    num_prefill_tokens: int = 0
+    num_decode_tokens: int = 0
+
+    # Running totals (accumulated across steps)
+    total_prefill_energy_kwh: float = 0.0
+    total_decode_energy_kwh: float = 0.0
+    total_prefill_tokens: int = 0
+    total_decode_tokens: int = 0
+
+
+@dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
 
@@ -188,6 +215,8 @@ class SchedulerStats:
     cudagraph_stats: CUDAGraphStat | None = None
 
     perf_stats: PerfStats | None = None
+
+    energy_stats: EnergyStats | None = None
 
 
 @dataclass

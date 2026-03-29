@@ -357,20 +357,51 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+
+        # ──────────────────────────────────────────────────
+        # STEP 1/3: SCHEDULER — decide what to run
+        # ──────────────────────────────────────────────────
         scheduler_output = self.scheduler.schedule()
+        print(f"\n{'='*60}")
+        print(f"  STEP 1 DONE — SCHEDULER OUTPUT")
+        print(f"  total_tokens_scheduled={scheduler_output.total_num_scheduled_tokens}")
+        print(f"  new_reqs={len(scheduler_output.scheduled_new_reqs)}")
+        print(f"  cached_reqs={len(scheduler_output.scheduled_cached_reqs.req_ids)}")
+        print(f"  finished_since_last_step={len(scheduler_output.finished_req_ids)}")
+        print(f"{'='*60}")
+
+        # ──────────────────────────────────────────────────
+        # STEP 2/3: MODEL EXECUTION — GPU forward pass
+        # ──────────────────────────────────────────────────
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with self.log_error_detail(scheduler_output):
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+        print(f"\n{'='*60}")
+        print(f"  STEP 2 DONE — MODEL OUTPUT")
+        print(f"  sampled_token_ids={model_output.sampled_token_ids}")
+        print(f"{'='*60}")
 
+        # ──────────────────────────────────────────────────
+        # STEP 3/3: UPDATE STATE — process outputs, free finished
+        # ──────────────────────────────────────────────────
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        print(f"\n{'='*60}")
+        print(f"  STEP 3 DONE — ENGINE OUTPUTS")
+        print(f"  clients_with_output={list(engine_core_outputs.keys())}")
+        for cid, eco in engine_core_outputs.items():
+            if eco.outputs:
+                for o in eco.outputs:
+                    print(f"    req={o.request_id} new_tokens={o.new_token_ids} "
+                          f"finished={o.finish_reason is not None}")
+        print(f"{'='*60}\n")
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -854,6 +885,14 @@ class EngineCoreProc(EngineCore):
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
+        # Optional subprocess profiling (VLLM_PROFILE_SUBPROCESS=1)
+        profile_subprocess = os.environ.get("VLLM_PROFILE_SUBPROCESS", "0") == "1"
+        profiler = None
+        if profile_subprocess:
+            import cProfile
+            profiler = cProfile.Profile()
+            profiler.enable()
+
         engine_core: EngineCoreProc | None = None
         try:
             parallel_config: ParallelConfig = kwargs["vllm_config"].parallel_config
@@ -882,6 +921,13 @@ class EngineCoreProc(EngineCore):
                 engine_core._send_engine_dead()
             raise e
         finally:
+            if profiler is not None:
+                profiler.disable()
+                profile_output = os.environ.get(
+                    "VLLM_PROFILE_OUTPUT", "/tmp/vllm_subprocess_profile.prof"
+                )
+                profiler.dump_stats(profile_output)
+                logger.info("Subprocess profile saved to: %s", profile_output)
             if engine_core is not None:
                 engine_core.shutdown()
 

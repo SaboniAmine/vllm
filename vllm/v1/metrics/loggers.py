@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -23,6 +24,7 @@ from vllm.v1.metrics.perf import PerfMetricsLogging
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import (
     CachingMetrics,
+    EnergyStats,
     IterationStats,
     MultiModalCacheStats,
     SchedulerStats,
@@ -30,6 +32,61 @@ from vllm.v1.metrics.stats import (
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingProm
 
 logger = init_logger(__name__)
+
+
+class EnergyMetricsLogging:
+    """Logging helper for energy metrics with prefill/decode breakdown."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.total_step_energy_kwh: float = 0.0
+        self.total_prefill_energy_kwh: float = 0.0
+        self.total_decode_energy_kwh: float = 0.0
+        self.total_prefill_tokens: int = 0
+        self.total_decode_tokens: int = 0
+
+    def observe(self, energy_stats: EnergyStats) -> None:
+        """Record energy stats from a step."""
+        self.total_step_energy_kwh += energy_stats.step_energy_kwh
+        self.total_prefill_energy_kwh += energy_stats.prefill_energy_kwh
+        self.total_decode_energy_kwh += energy_stats.decode_energy_kwh
+        self.total_prefill_tokens += energy_stats.num_prefill_tokens
+        self.total_decode_tokens += energy_stats.num_decode_tokens
+
+    def log(self, log_fn=logger.info, log_prefix: str = "") -> None:
+        """Log energy metrics and reset for next interval."""
+        if self.total_step_energy_kwh == 0:
+            return
+
+        # Convert to Wh for readability
+        total_wh = self.total_step_energy_kwh * 1000
+        prefill_wh = self.total_prefill_energy_kwh * 1000
+        decode_wh = self.total_decode_energy_kwh * 1000
+
+        # Energy per token (in Joules, 1 Wh = 3600 J)
+        prefill_j_per_token = (
+            (prefill_wh * 3.6) / self.total_prefill_tokens
+            if self.total_prefill_tokens > 0 else 0.0
+        )
+        decode_j_per_token = (
+            (decode_wh * 3.6) / self.total_decode_tokens
+            if self.total_decode_tokens > 0 else 0.0
+        )
+
+        log_fn(
+            "%sEnergy: %.3f Wh total (prefill: %.3f Wh @ %.2f J/tok, "
+            "decode: %.3f Wh @ %.2f J/tok)",
+            log_prefix,
+            total_wh,
+            prefill_wh,
+            prefill_j_per_token,
+            decode_wh,
+            decode_j_per_token,
+        )
+        self.reset()
+
 
 PerEngineStatLoggerFactory = Callable[[VllmConfig, int], "StatLoggerBase"]
 AggregateStatLoggerFactory = type["AggregateStatLoggerBase"]
@@ -122,6 +179,11 @@ class LoggingStatLogger(StatLoggerBase):
         if self._enable_perf_stats():
             self.perf_metrics_logging = PerfMetricsLogging(vllm_config)
 
+        # Energy logging (only if VLLM_TRACK_ENERGY=1)
+        self.energy_logging: EnergyMetricsLogging | None = None
+        if os.environ.get("VLLM_TRACK_ENERGY", "0") == "1":
+            self.energy_logging = EnergyMetricsLogging()
+
     def _reset(self, now):
         self.last_log_time = now
 
@@ -184,6 +246,8 @@ class LoggingStatLogger(StatLoggerBase):
                 self.last_scheduler_stats = scheduler_stats
             if (perf_stats := scheduler_stats.perf_stats) and self._enable_perf_stats():
                 self.perf_metrics_logging.observe(perf_stats)
+            if self.energy_logging and scheduler_stats.energy_stats:
+                self.energy_logging.observe(scheduler_stats.energy_stats)
         if mm_cache_stats:
             self.mm_caching_metrics.observe(mm_cache_stats)
 
@@ -265,6 +329,8 @@ class LoggingStatLogger(StatLoggerBase):
             self.cudagraph_logging.log(log_fn=log_fn)
         if self._enable_perf_stats():
             self.perf_metrics_logging.log(log_fn=log_fn, log_prefix=self.log_prefix)
+        if self.energy_logging:
+            self.energy_logging.log(log_fn=log_fn, log_prefix=self.log_prefix)
 
     def log_engine_initialized(self):
         if self.vllm_config.cache_config.num_gpu_blocks:
